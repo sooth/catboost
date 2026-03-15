@@ -118,7 +118,7 @@ def _is_cuda_array(obj):
         return False
 
 
-def _is_cudf_dataframe(obj):
+def _is_cudf_object(obj):
     mod = _get_object_module_name(obj)
     if not mod.startswith('cudf'):
         return False
@@ -129,9 +129,15 @@ def _is_cudf_dataframe(obj):
     return hasattr(obj, 'dtype') and hasattr(obj, 'to_cupy')
 
 def _is_dlpack_cuda(obj):
+    _KNOWN_DLPACK_MODULES = ('cupy', 'torch', 'jax', 'tensorflow')
     try:
         dev_fn = getattr(obj, '__dlpack_device__', None)
         if dev_fn is None or getattr(obj, '__dlpack__', None) is None:
+            return False
+        # Only call __dlpack_device__() on objects from known safe modules to
+        # avoid triggering side effects on arbitrary objects.
+        mod = _get_object_module_name(obj)
+        if not any(mod.startswith(m) for m in _KNOWN_DLPACK_MODULES):
             return False
         dev = dev_fn()
         # DLPack device types: kDLCPU=1, kDLCUDA=2, ...
@@ -141,7 +147,7 @@ def _is_dlpack_cuda(obj):
 
 
 def _is_gpu_input(obj):
-    return _is_cuda_array(obj) or _is_cudf_dataframe(obj) or _is_dlpack_cuda(obj)
+    return _is_cuda_array(obj) or _is_cudf_object(obj) or _is_dlpack_cuda(obj)
 
 if sys.version_info >= (3, 6):
     PATH_TYPES = STRING_TYPES + (os.PathLike,)
@@ -989,7 +995,7 @@ class Pool(_PoolBase):
         elif _is_gpu_input(data):
             data_shape = getattr(data, 'shape', None)
             # Special-case cuDF Series: allow as a single-column dataset (shape [n_objects]).
-            if _is_cudf_dataframe(data) and not hasattr(data, 'columns'):
+            if _is_cudf_object(data) and not hasattr(data, 'columns'):
                 if not data_shape or len(data_shape) != 1:
                     raise CatBoostError("Input data has invalid shape: {}. cuDF Series must be 1 dimensional".format(data_shape))
             else:
@@ -1486,7 +1492,7 @@ class Pool(_PoolBase):
         Initialize Pool from array like data.
         """
         if _is_gpu_input(data) or _is_gpu_input(label) or _is_gpu_input(weight):
-            is_cudf_series_input = _is_cudf_dataframe(data) and not hasattr(data, 'columns') and hasattr(data, 'to_frame')
+            is_cudf_series_input = _is_cudf_object(data) and not hasattr(data, 'columns') and hasattr(data, 'to_frame')
             if is_cudf_series_input:
                 if feature_names is None:
                     series_name = getattr(data, 'name', None)
@@ -1511,7 +1517,7 @@ class Pool(_PoolBase):
                     "are not supported for GPU-resident inputs."
                 )
 
-            if _is_cudf_dataframe(data) and feature_names is None and not is_cudf_series_input:
+            if _is_cudf_object(data) and feature_names is None and not is_cudf_series_input:
                 feature_names = [str(c) for c in data.columns]
 
             data_shape = getattr(data, 'shape', None)
@@ -1575,6 +1581,8 @@ class Pool(_PoolBase):
                 pairs, graph, weight, group_id, group_weight, subgroup_id, pairs_weight,
                 baseline, timestamp, feature_names, feature_tags, thread_count
             )
+            # Mark pool as GPU-resident; consumed via getattr(..., '_is_gpu_input', False)
+            # in the Cython layer (_catboost.pyx) so the attribute is safe to lose on copy.
             setattr(self, '_is_gpu_input', True)
             return
 

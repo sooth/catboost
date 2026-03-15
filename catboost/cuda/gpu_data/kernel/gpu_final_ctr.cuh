@@ -7,11 +7,13 @@
 namespace NKernel {
 
     // hashes[i] = CalcHash(hashes[i], (ui64)(i32)binToHash[bins[i]])
+    // bins[i] is bounds-checked against binToHashSize.
     // No synchronization is performed.
     void UpdateHashesFromCatFeature(
         const ui32* bins,
         ui32 size,
         const ui32* binToHash,
+        ui32 binToHashSize,
         ui64* hashes,
         TCudaStream stream
     );

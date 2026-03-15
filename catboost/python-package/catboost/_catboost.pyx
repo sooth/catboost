@@ -4887,7 +4887,17 @@ cdef class _PoolBase:
             else:
                 data_meta_info.TargetCount = <ui32>label_shape[1]
             if data_meta_info.TargetCount:
-                data_meta_info.TargetType = ERawTargetType_Float
+                # Dispatch target type based on label dtype, matching the
+                # non-GPU path's use of _py_target_type_to_raw_target_data.
+                label_dtype = getattr(label, 'dtype', None)
+                if label_dtype is not None and np.issubdtype(label_dtype, np.integer):
+                    data_meta_info.TargetType = ERawTargetType_Integer
+                elif label_dtype is not None and label_dtype == np.bool_:
+                    data_meta_info.TargetType = ERawTargetType_Boolean
+                else:
+                    # Default to float for floating-point and unrecognised dtypes;
+                    # string targets are not expected on GPU input paths.
+                    data_meta_info.TargetType = ERawTargetType_Float
 
         data_meta_info.BaselineCount = len(baseline[0]) if baseline is not None else 0
         data_meta_info.HasGroupId = group_id is not None
@@ -5764,6 +5774,10 @@ cdef class _CatBoost:
                     <ui32>out_elems,
                     devicesStr
                 )
+
+            # ApplyModelMultiGpuInputToDevice writes on cudaStreamPerThread;
+            # synchronize before CuPy post-processing which may use a different stream.
+            cp.cuda.runtime.deviceSynchronize()
 
             # GPU output path returns raw formula values; apply requested post-processing on GPU.
             if predictionType == EPredictionType_Probability:

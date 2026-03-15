@@ -822,7 +822,7 @@ def test_cupy_staged_predict_parity_vs_cpu():
     cpu_stages = list(model.staged_predict(x_cpu[:200], prediction_type="RawFormulaVal", eval_period=eval_period))
 
     x_gpu = cp.asarray(x_cpu)
-    gpu_stages = list(model.staged_predict(x_gpu[:200], prediction_type="RawFormulaVal", eval_period=eval_period))
+    gpu_stages = list(model.staged_predict(x_gpu[:200], prediction_type="RawFormulaVal", eval_period=eval_period, task_type="GPU"))
 
     assert len(cpu_stages) == len(gpu_stages)
     for cpu_pred, gpu_pred in zip(cpu_stages, gpu_stages):
@@ -854,7 +854,7 @@ def test_cupy_calc_leaf_indexes_parity_vs_cpu():
     cpu_leaf = model.calc_leaf_indexes(x_cpu[:200])
 
     x_gpu = cp.asarray(x_cpu)
-    gpu_leaf = model.calc_leaf_indexes(x_gpu[:200])
+    gpu_leaf = model.calc_leaf_indexes(x_gpu[:200], task_type="GPU")
 
     assert cpu_leaf.shape == gpu_leaf.shape
     assert cpu_leaf.dtype == gpu_leaf.dtype
@@ -933,3 +933,271 @@ def test_multi_gpu_predict_requires_input_device_in_devices():
 
         with pytest.raises(CatBoostError, match="Input device must be included"):
             model.predict(x_gpu[:10], task_type="GPU", output_type="cupy", devices="1")
+
+
+def test_cupy_predict_empty_batch():
+    _require_cuda()
+    cp = _require_cupy()
+
+    from catboost import CatBoostRegressor
+
+    rs = np.random.RandomState(0)
+    n = 500
+    f = 5
+    x_cpu = rs.rand(n, f).astype(np.float32)
+    y_cpu = (x_cpu[:, 0] * 0.5 + 0.1).astype(np.float32)
+
+    model = CatBoostRegressor(
+        iterations=10,
+        depth=4,
+        learning_rate=0.1,
+        loss_function="RMSE",
+        task_type="GPU",
+        devices="0",
+        verbose=False,
+        random_seed=0,
+    )
+    model.fit(x_cpu, y_cpu)
+
+    empty_gpu = cp.empty((0, f), dtype=cp.float32)
+    result = model.predict(empty_gpu, task_type="GPU")
+    assert result.shape == (0,)
+
+
+def test_cupy_predict_single_row():
+    _require_cuda()
+    cp = _require_cupy()
+
+    from catboost import CatBoostRegressor
+
+    rs = np.random.RandomState(0)
+    n = 500
+    f = 5
+    x_cpu = rs.rand(n, f).astype(np.float32)
+    y_cpu = (x_cpu[:, 0] * 0.5 + 0.1).astype(np.float32)
+
+    x_gpu = cp.asarray(x_cpu)
+    y_gpu = cp.asarray(y_cpu)
+
+    model = CatBoostRegressor(
+        iterations=10,
+        depth=4,
+        learning_rate=0.1,
+        loss_function="RMSE",
+        task_type="GPU",
+        devices="0",
+        verbose=False,
+        random_seed=0,
+    )
+    model.fit(x_gpu, y_gpu)
+
+    cpu_pred = model.predict(x_cpu[:1])
+    gpu_pred = model.predict(x_gpu[:1], task_type="GPU", output_type="cupy")
+    assert gpu_pred.shape == (1,)
+    np.testing.assert_allclose(cpu_pred, cp.asnumpy(gpu_pred), rtol=1e-6, atol=1e-6)
+
+
+def test_cupy_predict_binary_class_parity_vs_cpu():
+    _require_cuda()
+    cp = _require_cupy()
+
+    from catboost import CatBoostClassifier
+
+    rs = np.random.RandomState(0)
+    n = 2000
+    f = 10
+    x_cpu = rs.rand(n, f).astype(np.float32)
+    logits = (x_cpu[:, 0] * 1.5 - x_cpu[:, 1] * 1.0 + 0.2).astype(np.float32)
+    y_cpu = (rs.rand(n) < (1.0 / (1.0 + np.exp(-logits)))).astype(np.int32)
+
+    x_gpu = cp.asarray(x_cpu)
+    y_gpu = cp.asarray(y_cpu)
+
+    model = CatBoostClassifier(
+        iterations=20,
+        depth=6,
+        learning_rate=0.1,
+        loss_function="Logloss",
+        task_type="GPU",
+        devices="0",
+        verbose=False,
+        random_seed=0,
+    )
+    model.fit(x_gpu, y_gpu)
+
+    cpu_class = model.predict(x_cpu[:200], prediction_type="Class").reshape(-1)
+    gpu_class = model.predict(x_gpu[:200], prediction_type="Class", task_type="GPU", output_type="cupy")
+    assert isinstance(gpu_class, cp.ndarray)
+    np.testing.assert_array_equal(cpu_class, cp.asnumpy(gpu_class).reshape(-1))
+
+
+def test_cupy_predict_binary_log_proba_parity_vs_cpu():
+    _require_cuda()
+    cp = _require_cupy()
+
+    from catboost import CatBoostClassifier
+
+    rs = np.random.RandomState(0)
+    n = 2000
+    f = 10
+    x_cpu = rs.rand(n, f).astype(np.float32)
+    logits = (x_cpu[:, 0] * 1.5 - x_cpu[:, 1] * 1.0 + 0.2).astype(np.float32)
+    y_cpu = (rs.rand(n) < (1.0 / (1.0 + np.exp(-logits)))).astype(np.int32)
+
+    x_gpu = cp.asarray(x_cpu)
+    y_gpu = cp.asarray(y_cpu)
+
+    model = CatBoostClassifier(
+        iterations=20,
+        depth=6,
+        learning_rate=0.1,
+        loss_function="Logloss",
+        task_type="GPU",
+        devices="0",
+        verbose=False,
+        random_seed=0,
+    )
+    model.fit(x_gpu, y_gpu)
+
+    cpu_log_proba = model.predict(x_cpu[:200], prediction_type="LogProbability")
+    gpu_log_proba = model.predict(x_gpu[:200], prediction_type="LogProbability", task_type="GPU", output_type="cupy")
+    assert isinstance(gpu_log_proba, cp.ndarray)
+    assert gpu_log_proba.shape == cpu_log_proba.shape
+    np.testing.assert_allclose(cpu_log_proba, cp.asnumpy(gpu_log_proba), rtol=1e-6, atol=1e-6)
+
+
+def test_cupy_predict_output_cudf_regression():
+    _require_cuda()
+    cp = _require_cupy()
+    cudf = _require_cudf()
+
+    from catboost import CatBoostRegressor
+
+    rs = np.random.RandomState(0)
+    n = 2000
+    f = 10
+    x_cpu = rs.rand(n, f).astype(np.float32)
+    y_cpu = (x_cpu[:, 0] * 0.3 + x_cpu[:, 1] * -0.2 + 0.1).astype(np.float32)
+
+    x_gpu = cp.asarray(x_cpu)
+    y_gpu = cp.asarray(y_cpu)
+
+    model = CatBoostRegressor(
+        iterations=20,
+        depth=6,
+        learning_rate=0.1,
+        loss_function="RMSE",
+        task_type="GPU",
+        devices="0",
+        verbose=False,
+        random_seed=0,
+    )
+    model.fit(x_gpu, y_gpu)
+
+    result = model.predict(x_gpu[:200], task_type="GPU", output_type="cudf")
+    assert isinstance(result, cudf.Series)
+    assert len(result) == 200
+
+    cpu_pred = model.predict(x_cpu[:200])
+    np.testing.assert_allclose(cpu_pred, result.to_numpy(), rtol=1e-6, atol=1e-6)
+
+
+def test_cupy_predict_ntree_range_parity_vs_cpu():
+    _require_cuda()
+    cp = _require_cupy()
+
+    from catboost import CatBoostRegressor
+
+    rs = np.random.RandomState(0)
+    n = 2000
+    f = 10
+    x_cpu = rs.rand(n, f).astype(np.float32)
+    y_cpu = (x_cpu[:, 0] * 0.3 + x_cpu[:, 1] * -0.2 + 0.1).astype(np.float32)
+
+    x_gpu = cp.asarray(x_cpu)
+    y_gpu = cp.asarray(y_cpu)
+
+    model = CatBoostRegressor(
+        iterations=100,
+        depth=6,
+        learning_rate=0.1,
+        loss_function="RMSE",
+        task_type="GPU",
+        devices="0",
+        verbose=False,
+        random_seed=0,
+    )
+    model.fit(x_gpu, y_gpu)
+
+    cpu_pred = model.predict(x_cpu[:200], ntree_start=10, ntree_end=50)
+    gpu_pred = model.predict(x_gpu[:200], task_type="GPU", output_type="cupy", ntree_start=10, ntree_end=50)
+    assert isinstance(gpu_pred, cp.ndarray)
+    np.testing.assert_allclose(cpu_pred, cp.asnumpy(gpu_pred), rtol=1e-6, atol=1e-6)
+
+
+def test_cupy_predict_log_proba_wrapper_parity_vs_cpu():
+    _require_cuda()
+    cp = _require_cupy()
+
+    from catboost import CatBoostClassifier
+
+    rs = np.random.RandomState(0)
+    n = 2000
+    f = 10
+    x_cpu = rs.rand(n, f).astype(np.float32)
+    logits = (x_cpu[:, 0] * 1.5 - x_cpu[:, 1] * 1.0 + 0.2).astype(np.float32)
+    y_cpu = (rs.rand(n) < (1.0 / (1.0 + np.exp(-logits)))).astype(np.int32)
+
+    x_gpu = cp.asarray(x_cpu)
+    y_gpu = cp.asarray(y_cpu)
+
+    model = CatBoostClassifier(
+        iterations=20,
+        depth=6,
+        learning_rate=0.1,
+        loss_function="Logloss",
+        task_type="GPU",
+        devices="0",
+        verbose=False,
+        random_seed=0,
+    )
+    model.fit(x_gpu, y_gpu)
+
+    cpu_log_proba = model.predict_log_proba(x_cpu[:200])
+    gpu_log_proba = model.predict_log_proba(x_gpu[:200], task_type="GPU", output_type="cupy")
+    assert isinstance(gpu_log_proba, cp.ndarray)
+    assert gpu_log_proba.shape == cpu_log_proba.shape
+    np.testing.assert_allclose(cpu_log_proba, cp.asnumpy(gpu_log_proba), rtol=1e-6, atol=1e-6)
+
+
+def test_cupy_predict_column_strided_parity_vs_cpu():
+    _require_cuda()
+    cp = _require_cupy()
+
+    from catboost import CatBoostRegressor
+
+    rs = np.random.RandomState(0)
+    n = 2000
+    f = 8
+    f_full = f * 2
+    x_cpu_full = rs.rand(n, f_full).astype(np.float32)
+    x_cpu = x_cpu_full[:, ::2]  # every other column, 8 features
+    y_cpu = (x_cpu[:, 0] * 0.3 + x_cpu[:, 1] * -0.2 + 0.1).astype(np.float32)
+
+    model = CatBoostRegressor(
+        iterations=20,
+        depth=6,
+        learning_rate=0.1,
+        loss_function="RMSE",
+        verbose=False,
+        random_seed=0,
+    )
+    model.fit(np.ascontiguousarray(x_cpu), y_cpu)
+
+    x_gpu_full = cp.asarray(x_cpu_full)
+    x_strided = x_gpu_full[:200, ::2]  # non-contiguous column stride
+
+    cpu_pred = model.predict(np.ascontiguousarray(x_cpu[:200]))
+    gpu_pred = model.predict(x_strided, task_type="GPU", output_type="cupy")
+    assert isinstance(gpu_pred, cp.ndarray)
+    np.testing.assert_allclose(cpu_pred, cp.asnumpy(gpu_pred), rtol=1e-6, atol=1e-6)

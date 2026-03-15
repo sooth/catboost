@@ -167,6 +167,11 @@ void NCudaLib::TMemcpyTracker::Record(EMemcpyDirection direction, ui64 bytes) {
             HostToDeviceBytes.fetch_add(bytes);
             break;
         case EMemcpyDirection::DeviceToHost: {
+            // Note: limit enforcement is best-effort under concurrent D2H calls.
+            // The cumulative counter is always accurate, but two concurrent copies
+            // may both pass the limit check before either sees the other's contribution.
+            // This is acceptable because memcpy tracking is a test instrumentation tool,
+            // not a security boundary.
             const ui64 newTotal = DeviceToHostBytes.fetch_add(bytes) + bytes;
             if (StrictNoD2H.load()) {
                 const bool hasSingleLimit = HasDeviceToHostSingleBytesLimit.load();

@@ -64,6 +64,9 @@ def test_cupy_input_regression_parity():
     pred_cpu = model_cpu_input.predict(x_cpu[:200])
     pred_gpu = model_gpu_input.predict(x_cpu[:200])
 
+    # Tolerance is intentionally loose (2e-2) compared to prediction parity tests (1e-6)
+    # because GPU training with different input paths (host vs device) may produce
+    # slightly different models due to floating-point non-determinism in GPU reduction order.
     assert np.max(np.abs(pred_cpu - pred_gpu)) < 2e-2
 
 
@@ -99,7 +102,7 @@ def test_cudf_input_cat_ctr_smoke():
     )
     model.fit(x_df, y_s, cat_features=[0])
 
-    # Prediction API does not accept cuDF directly; use host representation here.
+    # Use host representation here for simplicity; see test_native_gpu_prediction.py for GPU prediction tests.
     proba = model.predict_proba(x_df.to_pandas())
     assert proba.shape == (n, 2)
 
@@ -227,3 +230,171 @@ def test_cupy_input_multigpu_smoke():
         random_seed=0,
     )
     model.fit(x, y)
+
+
+def test_dlpack_input_regression_parity():
+    _require_cuda()
+    cp = _require_cupy()
+
+    from catboost import CatBoostRegressor
+
+    class DLPackOnly:
+        def __init__(self, arr):
+            self._arr = arr
+
+        @property
+        def shape(self):
+            return self._arr.shape
+
+        def __dlpack__(self, stream=None):
+            return self._arr.__dlpack__(stream=stream)
+
+        def __dlpack_device__(self):
+            return self._arr.__dlpack_device__()
+
+    rs = np.random.RandomState(0)
+    n = 2000
+    f = 10
+    x_cpu = rs.rand(n, f).astype(np.float32)
+    y_cpu = (x_cpu[:, 0] * 0.3 + x_cpu[:, 1] * -0.2 + 0.1).astype(np.float32)
+
+    x_gpu = cp.asarray(x_cpu)
+    y_gpu = cp.asarray(y_cpu)
+
+    x_dlpack = DLPackOnly(x_gpu)
+    y_dlpack = DLPackOnly(y_gpu)
+
+    params = dict(
+        iterations=20,
+        depth=6,
+        learning_rate=0.1,
+        loss_function="RMSE",
+        task_type="GPU",
+        devices="0",
+        random_seed=0,
+        verbose=False,
+    )
+
+    model_cpu_input = CatBoostRegressor(**params)
+    model_cpu_input.fit(x_cpu, y_cpu)
+
+    model_dlpack_input = CatBoostRegressor(**params)
+    model_dlpack_input.fit(x_dlpack, y_dlpack)
+
+    pred_cpu = model_cpu_input.predict(x_cpu[:200])
+    pred_dlpack = model_dlpack_input.predict(x_cpu[:200])
+
+    # Tolerance is intentionally loose (2e-2) compared to prediction parity tests (1e-6)
+    # because GPU training with different input paths (host vs device) may produce
+    # slightly different models due to floating-point non-determinism in GPU reduction order.
+    assert np.max(np.abs(pred_cpu - pred_dlpack)) < 2e-2
+
+
+def test_cudf_series_input_regression_parity():
+    _require_cuda()
+    _require_cupy()
+    cudf = _require_cudf()
+
+    from catboost import CatBoostRegressor
+
+    rs = np.random.RandomState(0)
+    n = 2000
+    x_cpu = rs.rand(n).astype(np.float32)
+    y_cpu = (x_cpu * 0.3 + 0.1).astype(np.float32)
+
+    x_series = cudf.Series(x_cpu)
+    y_series = cudf.Series(y_cpu)
+
+    params = dict(
+        iterations=20,
+        depth=6,
+        learning_rate=0.1,
+        loss_function="RMSE",
+        task_type="GPU",
+        devices="0",
+        random_seed=0,
+        verbose=False,
+    )
+
+    model_cpu_input = CatBoostRegressor(**params)
+    model_cpu_input.fit(x_cpu.reshape(-1, 1), y_cpu)
+
+    model_cudf_input = CatBoostRegressor(**params)
+    model_cudf_input.fit(x_series, y_series)
+
+    pred_cpu = model_cpu_input.predict(x_cpu[:200].reshape(-1, 1))
+    pred_cudf = model_cudf_input.predict(x_cpu[:200].reshape(-1, 1))
+
+    # Tolerance is intentionally loose (2e-2) compared to prediction parity tests (1e-6)
+    # because GPU training with different input paths (host vs device) may produce
+    # slightly different models due to floating-point non-determinism in GPU reduction order.
+    assert np.max(np.abs(pred_cpu - pred_cudf)) < 2e-2
+
+
+def test_memcpy_tracker_h2d_counter():
+    _require_cuda()
+    _require_cupy()
+
+    import catboost._catboost as cb
+    from catboost import CatBoostRegressor
+
+    cb._cuda_memcpy_tracker_reset_stats()
+
+    rs = np.random.RandomState(0)
+    n = 500
+    f = 5
+    x_cpu = rs.rand(n, f).astype(np.float32)
+    y_cpu = (x_cpu[:, 0] * 0.5 + 0.1).astype(np.float32)
+
+    model = CatBoostRegressor(
+        iterations=5,
+        depth=4,
+        learning_rate=0.1,
+        loss_function="RMSE",
+        task_type="GPU",
+        devices="0",
+        verbose=False,
+        random_seed=0,
+    )
+    model.fit(x_cpu, y_cpu)
+
+    stats = cb._cuda_memcpy_tracker_get_stats()
+    assert stats["host_to_device_bytes"] > 0
+
+
+def test_memcpy_tracker_reset_clears_stats():
+    _require_cuda()
+    _require_cupy()
+
+    import catboost._catboost as cb
+    from catboost import CatBoostRegressor
+
+    cb._cuda_memcpy_tracker_reset_stats()
+
+    rs = np.random.RandomState(0)
+    n = 500
+    f = 5
+    x_cpu = rs.rand(n, f).astype(np.float32)
+    y_cpu = (x_cpu[:, 0] * 0.5 + 0.1).astype(np.float32)
+
+    model = CatBoostRegressor(
+        iterations=5,
+        depth=4,
+        learning_rate=0.1,
+        loss_function="RMSE",
+        task_type="GPU",
+        devices="0",
+        verbose=False,
+        random_seed=0,
+    )
+    model.fit(x_cpu, y_cpu)
+
+    stats = cb._cuda_memcpy_tracker_get_stats()
+    assert stats["host_to_device_bytes"] > 0 or stats["device_to_host_bytes"] > 0
+
+    cb._cuda_memcpy_tracker_reset_stats()
+
+    stats = cb._cuda_memcpy_tracker_get_stats()
+    assert stats["host_to_device_bytes"] == 0
+    assert stats["device_to_host_bytes"] == 0
+    assert stats["device_to_device_bytes"] == 0

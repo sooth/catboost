@@ -686,6 +686,7 @@ namespace {
         if (typestr.size() < 3) {
             ythrow TCatBoostException() << "Invalid __cuda_array_interface__ typestr: '" << typestr << "'";
         }
+        CB_ENSURE(typestr[0] != '>', "Big-endian byte order is not supported for GPU arrays");
         const char kind = typestr[1];
         const int itemSize = FromString<int>(typestr.substr(2));
         switch (kind) {
@@ -841,6 +842,9 @@ namespace {
         TCudaArrayInterface result;
         PyObject* caiObj = PyObject_GetAttrString(obj, "__cuda_array_interface__"); // new ref
         CB_ENSURE(caiObj, "Object has no __cuda_array_interface__");
+        Y_DEFER {
+            Py_DECREF(caiObj);
+        };
         CB_ENSURE(PyDict_Check(caiObj), "__cuda_array_interface__ is not a dict");
 
         PyObject* dataTuple = PyDict_GetItemString(caiObj, "data"); // borrowed
@@ -895,7 +899,6 @@ namespace {
             result.Stream = PyLong_AsUnsignedLongLong(streamObj);
         }
 
-        Py_DECREF(caiObj);
         return result;
     }
 
@@ -984,6 +987,14 @@ namespace {
             }
             return;
         }
+        if (IsCudfDataFrame(obj)) {
+            FillColumnsFromCudfDataFrame(obj, columns, holders);
+            return;
+        }
+        if (IsCudfSeries(obj)) {
+            FillColumnsFromCudfSeries(obj, columns, holders);
+            return;
+        }
         if (HasDLPack(obj)) {
             const auto dlpack = ParseDlpackToCudaArrayInterface(obj);
             if (dlpack.Cai.Shape.size() == 1) {
@@ -995,14 +1006,6 @@ namespace {
             if (dlpack.Holder) {
                 holders->push_back(dlpack.Holder);
             }
-            return;
-        }
-        if (IsCudfDataFrame(obj)) {
-            FillColumnsFromCudfDataFrame(obj, columns, holders);
-            return;
-        }
-        if (IsCudfSeries(obj)) {
-            FillColumnsFromCudfSeries(obj, columns, holders);
             return;
         }
         ythrow TCatBoostException() << "Unsupported GPU input type (expected CuPy ndarray, DLPack tensor, or cuDF DataFrame/Series)";
@@ -1143,6 +1146,9 @@ namespace {
         PyObject* iter = PyObject_GetIter(columnsObj); // new ref
         Py_DECREF(columnsObj);
         CB_ENSURE(iter, "Failed to iterate cudf.DataFrame.columns");
+        Y_DEFER {
+            Py_DECREF(iter);
+        };
 
         TVector<TGpuInputColumnDesc> result;
         ui32 objectCount = 0;
@@ -1165,7 +1171,9 @@ namespace {
                 desc.DeviceId = GetDeviceIdFromPointer(reinterpret_cast<const void*>(cai.Data));
                 desc.Stream = cai.Stream;
             }
-            Py_DECREF(series);
+
+            // Keep the Series alive -- its Python object owns the GPU memory backing desc.Data.
+            holders->push_back(MakeIntrusive<TPyObjectResourceHolder>(series));
 
             const ui32 colObjectCount = desc.FullObjectCount;
             if (result.empty()) {
@@ -1176,7 +1184,6 @@ namespace {
 
             result.push_back(desc);
         }
-        Py_DECREF(iter);
 
         columns->swap(result);
     }
@@ -2082,7 +2089,7 @@ void ApplyModelMultiGpuInputToDevice(
 
     const ui32 objectCount = SafeIntegerCast<ui32>(gpuObjects->GetObjectCount());
     CB_ENSURE(dstDevicePtr != 0 || objectCount == 0, "Destination device pointer is null");
-    CB_ENSURE(dstSize == static_cast<ui32>(static_cast<size_t>(objectCount) * approxDimension), "Destination buffer size mismatch");
+    CB_ENSURE(static_cast<ui64>(dstSize) == static_cast<ui64>(objectCount) * static_cast<ui64>(approxDimension), "Destination buffer size mismatch");
     if (objectCount == 0) {
         return;
     }

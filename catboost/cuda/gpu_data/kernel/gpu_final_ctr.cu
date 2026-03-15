@@ -13,11 +13,16 @@ namespace NKernel {
             const ui32* __restrict bins,
             ui32 size,
             const ui32* __restrict binToHash,
+            ui32 binToHashSize,
             ui64* __restrict hashes
         ) {
             const ui32 i = blockIdx.x * blockDim.x + threadIdx.x;
             if (i < size) {
                 const ui32 bin = bins[i];
+                assert(bin < binToHashSize);
+                if (bin >= binToHashSize) {
+                    return;
+                }
                 const ui32 hash32 = binToHash[bin];
                 const ui64 hash64 = (ui64)(int)hash32;
                 hashes[i] = CalcHashDevice(hashes[i], hash64);
@@ -125,6 +130,7 @@ namespace NKernel {
         const ui32* bins,
         ui32 size,
         const ui32* binToHash,
+        ui32 binToHashSize,
         ui64* hashes,
         TCudaStream stream
     ) {
@@ -133,7 +139,7 @@ namespace NKernel {
         }
         const ui32 blockSize = 256;
         const ui32 numBlocks = (size + blockSize - 1) / blockSize;
-        UpdateHashesFromCatFeatureImpl<<<numBlocks, blockSize, 0, stream>>>(bins, size, binToHash, hashes);
+        UpdateHashesFromCatFeatureImpl<<<numBlocks, blockSize, 0, stream>>>(bins, size, binToHash, binToHashSize, hashes);
     }
 
     void UpdateHashesFromFloatSplit(

@@ -1178,6 +1178,8 @@ namespace {
         binToHashMapsDev.reserve(projection.CatFeatures.size());
         TVector<const ui32*> binToHashPtrsDev;
         binToHashPtrsDev.reserve(projection.CatFeatures.size());
+        TVector<ui32> binToHashSizesDev;
+        binToHashSizesDev.reserve(projection.CatFeatures.size());
 
         for (const int featureIdx : projection.CatFeatures) {
             CB_ENSURE(
@@ -1190,6 +1192,7 @@ namespace {
                 CopyHostToDevice(mapping.data(), mappingDev.Get(), mapping.size(), stream);
             }
             binToHashPtrsDev.push_back(mappingDev.Get());
+            binToHashSizesDev.push_back(static_cast<ui32>(mapping.size()));
             binToHashMapsDev.push_back(std::move(mappingDev));
         }
 
@@ -1207,6 +1210,7 @@ namespace {
                 bins,
                 learnSampleCount,
                 binToHashPtrsDev[f],
+                binToHashSizesDev[f],
                 hashesDev.Get() + offset,
                 stream
             );
@@ -1307,6 +1311,7 @@ namespace {
                         bins,
                         testCount,
                         binToHashPtrsDev[f],
+                        binToHashSizesDev[f],
                         hashesDev.Get() + offset,
                         stream
                     );

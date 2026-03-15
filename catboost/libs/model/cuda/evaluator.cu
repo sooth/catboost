@@ -253,7 +253,10 @@ __device__ __forceinline__ ui32 GetDenseHashIndex(
 ) {
     const ui64 mask = static_cast<ui64>(bucketCount - 1);
     ui64 z = hash & mask;
-    while (true) {
+    // Bound the probe count to bucketCount to prevent infinite loops on
+    // corrupted hash tables. In a correctly-sized power-of-two open-addressing
+    // table every slot is visited in at most bucketCount probes.
+    for (ui32 probe = 0; probe < bucketCount; ++probe) {
         const ui64 curHash = __ldg(&buckets[z].Hash);
         if (curHash == TGPUCtrBucket::InvalidHashValue) {
             return TGPUCtrBucket::NotFoundIndex;
@@ -263,6 +266,9 @@ __device__ __forceinline__ ui32 GetDenseHashIndex(
         }
         z = (z + 1) & mask;
     }
+    // All slots probed without finding the key or an empty slot.
+    // Table is either full or corrupted.
+    return TGPUCtrBucket::NotFoundIndex;
 }
 
 __device__ __forceinline__ float CalcCtrValue(

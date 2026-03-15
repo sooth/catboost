@@ -133,6 +133,12 @@ def _is_dlpack_cuda(obj):
     # __dlpack_device__() is a pure query per the Python Array API spec (no allocation, no
     # ownership transfer) so it is safe to call on arbitrary objects.  The try/except and
     # return-type validation guard against misbehaving implementations.
+    #
+    # Fast-path: skip known CPU-only libraries that implement DLPack (e.g. numpy >= 1.22)
+    # to avoid a Python method call on the most common input type.
+    mod = getattr(obj.__class__, '__module__', '') or ''
+    if mod.startswith(('numpy', 'builtins', 'pandas', 'polars')):
+        return False
     try:
         dev_fn = getattr(obj, '__dlpack_device__', None)
         if dev_fn is None or getattr(obj, '__dlpack__', None) is None:
@@ -3236,27 +3242,18 @@ class CatBoost(_CatBoostBase):
         if verbose is None:
             verbose = False
         data, data_is_single_object = self._process_predict_input_data(data, parent_method_name, thread_count)
+        if data is None:
+            return  # empty GPU batch: empty generator
         self._validate_prediction_type(prediction_type)
 
         if ntree_end == 0:
             ntree_end = self.tree_count_
 
-        if task_type == "GPU":
-            # GPU staged prediction: iterate over tree ranges calling _base_predict for each stage.
-            # Matches the CPU iterator semantics: yield at ntree_start+eval_period, ntree_start+2*eval_period, ..., ntree_end.
-            devices_ = self.get_param("devices")
-            end = ntree_start + eval_period
-            while end < ntree_end:
-                predictions = self._base_predict(data, prediction_type, ntree_start, end, thread_count, verbose, task_type, None, devices_)
-                yield predictions[0] if data_is_single_object else predictions
-                end += eval_period
-            # Always yield at ntree_end (final stage)
-            predictions = self._base_predict(data, prediction_type, ntree_start, ntree_end, thread_count, verbose, task_type, None, devices_)
+        # The Cython _staged_predict_iterator already routes GPU-resident pools
+        # to _GpuStagedPredictIterator automatically based on pool._is_gpu_input.
+        staged_predict_iterator = self._staged_predict_iterator(data, prediction_type, ntree_start, ntree_end, eval_period, thread_count, verbose)
+        for predictions in staged_predict_iterator:
             yield predictions[0] if data_is_single_object else predictions
-        else:
-            staged_predict_iterator = self._staged_predict_iterator(data, prediction_type, ntree_start, ntree_end, eval_period, thread_count, verbose)
-            for predictions in staged_predict_iterator:
-                yield predictions[0] if data_is_single_object else predictions
 
     def staged_predict(self, data, prediction_type='RawFormulaVal', ntree_start=0, ntree_end=0, eval_period=1, thread_count=-1, verbose=None, task_type="CPU"):
         """
@@ -3318,6 +3315,8 @@ class CatBoost(_CatBoostBase):
         if ntree_end == 0:
             ntree_end = self.tree_count_
         data, _ = self._process_predict_input_data(data, "iterate_leaf_indexes", thread_count=-1)
+        if data is None:
+            return  # empty GPU batch: empty iterator
         leaf_indexes_iterator = self._leaf_indexes_iterator(data, ntree_start, ntree_end)
         for leaf_index in leaf_indexes_iterator:
             yield leaf_index

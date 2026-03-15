@@ -85,12 +85,12 @@ namespace NCB {
             , Data(std::move(data))
         {}
 
-        bool EqualTo(const TObjectsDataProvider& rhs, bool ignoreSparsity = false) const override {
+        bool EqualTo(const TObjectsDataProvider& rhs, bool ignoreSparsity = false, bool ignoreCatFeaturesHashToString = false) const override {
             const auto* rhsGpuData = dynamic_cast<const TGpuRawObjectsDataProvider*>(&rhs);
             if (!rhsGpuData) {
                 return false;
             }
-            return TObjectsDataProvider::EqualTo(rhs, ignoreSparsity) && (Data == rhsGpuData->Data);
+            return TObjectsDataProvider::EqualTo(rhs, ignoreSparsity, ignoreCatFeaturesHashToString) && (Data == rhsGpuData->Data);
         }
 
         bool HasDenseData() const override {

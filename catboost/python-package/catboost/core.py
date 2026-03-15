@@ -129,15 +129,13 @@ def _is_cudf_object(obj):
     return hasattr(obj, 'dtype') and hasattr(obj, 'to_cupy')
 
 def _is_dlpack_cuda(obj):
-    _KNOWN_DLPACK_MODULES = ('cupy', 'torch', 'jax', 'tensorflow')
+    # Duck-type any object implementing the DLPack protocol (__dlpack__ + __dlpack_device__).
+    # __dlpack_device__() is a pure query per the Python Array API spec (no allocation, no
+    # ownership transfer) so it is safe to call on arbitrary objects.  The try/except and
+    # return-type validation guard against misbehaving implementations.
     try:
         dev_fn = getattr(obj, '__dlpack_device__', None)
         if dev_fn is None or getattr(obj, '__dlpack__', None) is None:
-            return False
-        # Only call __dlpack_device__() on objects from known safe modules to
-        # avoid triggering side effects on arbitrary objects.
-        mod = _get_object_module_name(obj)
-        if not any(mod.startswith(m) for m in _KNOWN_DLPACK_MODULES):
             return False
         dev = dev_fn()
         # DLPack device types: kDLCPU=1, kDLCUDA=2, ...
@@ -3065,6 +3063,12 @@ class CatBoost(_CatBoostBase):
         if not self.is_fitted() or self.tree_count_ is None:
             raise CatBoostError(("There is no trained model to use {}(). "
                                  "Use fit() to train model. Then use this method.").format(parent_method_name))
+        # Handle empty GPU arrays: CuPy/DLPack arrays with 0 rows have null data pointers
+        # which the C++ layer cannot process.  Return a sentinel so callers can short-circuit.
+        if _is_gpu_input(data) and not isinstance(data, Pool):
+            data_shape = getattr(data, 'shape', None)
+            if data_shape is not None and len(data_shape) >= 1 and data_shape[0] == 0:
+                return None, False  # sentinel for empty batch
         is_single_object = _is_data_single_object(data)
         if not isinstance(data, Pool):
             data = Pool(
@@ -3088,6 +3092,9 @@ class CatBoost(_CatBoostBase):
         if verbose is None:
             verbose = False
         data, data_is_single_object = self._process_predict_input_data(data, parent_method_name, thread_count)
+        if data is None:
+            # Empty GPU batch: return empty numpy array with appropriate shape
+            return np.empty(0, dtype=np.float64)
         self._validate_prediction_type(prediction_type)
 
         devices_ = devices
@@ -3224,7 +3231,7 @@ class CatBoost(_CatBoostBase):
         """
         return self._virtual_ensembles_predict(data, prediction_type, ntree_end, virtual_ensembles_count, thread_count, verbose, 'virtual_ensembles_predict')
 
-    def _staged_predict(self, data, prediction_type, ntree_start, ntree_end, eval_period, thread_count, verbose, parent_method_name):
+    def _staged_predict(self, data, prediction_type, ntree_start, ntree_end, eval_period, thread_count, verbose, parent_method_name, task_type="CPU"):
         verbose = verbose or self.get_param('verbose')
         if verbose is None:
             verbose = False
@@ -3233,11 +3240,25 @@ class CatBoost(_CatBoostBase):
 
         if ntree_end == 0:
             ntree_end = self.tree_count_
-        staged_predict_iterator = self._staged_predict_iterator(data, prediction_type, ntree_start, ntree_end, eval_period, thread_count, verbose)
-        for predictions in staged_predict_iterator:
-            yield predictions[0] if data_is_single_object else predictions
 
-    def staged_predict(self, data, prediction_type='RawFormulaVal', ntree_start=0, ntree_end=0, eval_period=1, thread_count=-1, verbose=None):
+        if task_type == "GPU":
+            # GPU staged prediction: iterate over tree ranges calling _base_predict for each stage.
+            # Matches the CPU iterator semantics: yield at ntree_start+eval_period, ntree_start+2*eval_period, ..., ntree_end.
+            devices_ = self.get_param("devices")
+            end = ntree_start + eval_period
+            while end < ntree_end:
+                predictions = self._base_predict(data, prediction_type, ntree_start, end, thread_count, verbose, task_type, None, devices_)
+                yield predictions[0] if data_is_single_object else predictions
+                end += eval_period
+            # Always yield at ntree_end (final stage)
+            predictions = self._base_predict(data, prediction_type, ntree_start, ntree_end, thread_count, verbose, task_type, None, devices_)
+            yield predictions[0] if data_is_single_object else predictions
+        else:
+            staged_predict_iterator = self._staged_predict_iterator(data, prediction_type, ntree_start, ntree_end, eval_period, thread_count, verbose)
+            for predictions in staged_predict_iterator:
+                yield predictions[0] if data_is_single_object else predictions
+
+    def staged_predict(self, data, prediction_type='RawFormulaVal', ntree_start=0, ntree_end=0, eval_period=1, thread_count=-1, verbose=None, task_type="CPU"):
         """
         Predict target at each stage for data.
 
@@ -3275,6 +3296,9 @@ class CatBoost(_CatBoostBase):
         verbose : bool
             If True, writes the evaluation metric measured set to stderr.
 
+        task_type : string, optional (default="CPU")
+            The execution backend: "CPU" or "GPU".
+
         Returns
         -------
         prediction : generator for each iteration that generates:
@@ -3288,7 +3312,7 @@ class CatBoost(_CatBoostBase):
                 - 'Probability' : two-dimensional numpy.ndarray with shape (number_of_objects x number_of_classes)
                   with probability for every class for each object.
         """
-        return self._staged_predict(data, prediction_type, ntree_start, ntree_end, eval_period, thread_count, verbose, 'staged_predict')
+        return self._staged_predict(data, prediction_type, ntree_start, ntree_end, eval_period, thread_count, verbose, 'staged_predict', task_type)
 
     def _iterate_leaf_indexes(self, data, ntree_start, ntree_end):
         if ntree_end == 0:
@@ -3323,13 +3347,15 @@ class CatBoost(_CatBoostBase):
         """
         return self._iterate_leaf_indexes(data, ntree_start, ntree_end)
 
-    def _calc_leaf_indexes(self, data, ntree_start, ntree_end, thread_count, verbose):
+    def _calc_leaf_indexes(self, data, ntree_start, ntree_end, thread_count, verbose, task_type="CPU"):
         if ntree_end == 0:
             ntree_end = self.tree_count_
         data, _ = self._process_predict_input_data(data, "calc_leaf_indexes", thread_count)
+        if data is None:
+            return np.empty((0, ntree_end - ntree_start), dtype=np.uint32)
         return self._base_calc_leaf_indexes(data, ntree_start, ntree_end, thread_count, verbose)
 
-    def calc_leaf_indexes(self, data, ntree_start=0, ntree_end=0, thread_count=-1, verbose=False):
+    def calc_leaf_indexes(self, data, ntree_start=0, ntree_end=0, thread_count=-1, verbose=False, task_type="CPU"):
         """
         Returns indexes of leafs to which objects from pool are mapped by model trees.
 
@@ -3356,12 +3382,15 @@ class CatBoost(_CatBoostBase):
         verbose : bool (default=False)
             Enable debug logging level.
 
+        task_type : string, optional (default="CPU")
+            The execution backend: "CPU" or "GPU".
+
         Returns
         -------
         leaf_indexes : 2-dimensional numpy.ndarray of numpy.uint32 with shape (object count, ntree_end - ntree_start).
             i-th row is an array of leaf indexes for i-th object.
         """
-        return self._calc_leaf_indexes(data, ntree_start, ntree_end, thread_count, verbose)
+        return self._calc_leaf_indexes(data, ntree_start, ntree_end, thread_count, verbose, task_type)
 
     def get_cat_feature_indices(self):
         if not self.is_fitted():
@@ -5867,7 +5896,7 @@ class CatBoostClassifier(CatBoost):
         """
         return self._predict(data, 'LogProbability', ntree_start, ntree_end, thread_count, verbose, 'predict_log_proba', task_type, output_type, devices)
 
-    def staged_predict(self, data, prediction_type='Class', ntree_start=0, ntree_end=0, eval_period=1, thread_count=-1, verbose=None):
+    def staged_predict(self, data, prediction_type='Class', ntree_start=0, ntree_end=0, eval_period=1, thread_count=-1, verbose=None, task_type="CPU"):
         """
         Predict target at each stage for data.
 
@@ -5904,6 +5933,9 @@ class CatBoostClassifier(CatBoost):
         verbose : bool
             If True, writes the evaluation metric measured set to stderr.
 
+        task_type : string, optional (default="CPU")
+            The execution backend: "CPU" or "GPU".
+
         Returns
         -------
         prediction : generator for each iteration that generates:
@@ -5921,7 +5953,7 @@ class CatBoostClassifier(CatBoost):
                 - 'LogProbability' : two-dimensional numpy.ndarray with shape (number_of_objects x number_of_classes)
                   with log probability for every class for each object.
         """
-        return self._staged_predict(data, prediction_type, ntree_start, ntree_end, eval_period, thread_count, verbose, 'staged_predict')
+        return self._staged_predict(data, prediction_type, ntree_start, ntree_end, eval_period, thread_count, verbose, 'staged_predict', task_type)
 
     def staged_predict_proba(self, data, ntree_start=0, ntree_end=0, eval_period=1, thread_count=-1, verbose=None):
         """
@@ -6401,7 +6433,7 @@ class CatBoostRegressor(CatBoost):
             prediction_type = self._get_default_prediction_type()
         return self._predict(data, prediction_type, ntree_start, ntree_end, thread_count, verbose, 'predict', task_type, output_type, devices)
 
-    def staged_predict(self, data, prediction_type='RawFormulaVal', ntree_start=0, ntree_end=0, eval_period=1, thread_count=-1, verbose=None):
+    def staged_predict(self, data, prediction_type='RawFormulaVal', ntree_start=0, ntree_end=0, eval_period=1, thread_count=-1, verbose=None, task_type="CPU"):
         """
         Predict target at each stage for data.
 
@@ -6437,7 +6469,7 @@ class CatBoostRegressor(CatBoost):
             If data is for a single object, the return value is single float formula return value
             otherwise one-dimensional numpy.ndarray of formula return values for each object.
         """
-        return self._staged_predict(data, prediction_type, ntree_start, ntree_end, eval_period, thread_count, verbose, 'staged_predict')
+        return self._staged_predict(data, prediction_type, ntree_start, ntree_end, eval_period, thread_count, verbose, 'staged_predict', task_type)
 
     def score(self, X, y=None):
         """
@@ -6794,7 +6826,7 @@ class CatBoostRanker(CatBoost):
         """
         return self._predict(X, 'RawFormulaVal', ntree_start, ntree_end, thread_count, verbose, 'predict', task_type, output_type, devices)
 
-    def staged_predict(self, X, ntree_start=0, ntree_end=0, eval_period=1, thread_count=-1, verbose=None):
+    def staged_predict(self, X, ntree_start=0, ntree_end=0, eval_period=1, thread_count=-1, verbose=None, task_type="CPU"):
         """
         Predict target at each stage for data.
         Parameters
@@ -6823,7 +6855,7 @@ class CatBoostRanker(CatBoost):
             If data is for a single object, the return value is single float formula return value
             otherwise one-dimensional numpy.ndarray of formula return values for each object.
         """
-        return self._staged_predict(X, 'RawFormulaVal', ntree_start, ntree_end, eval_period, thread_count, verbose, 'staged_predict')
+        return self._staged_predict(X, 'RawFormulaVal', ntree_start, ntree_end, eval_period, thread_count, verbose, 'staged_predict', task_type)
 
     def score(self, X, y=None, group_id=None, top=None, type=None, denominator=None, group_weight=None, thread_count=-1):
         """

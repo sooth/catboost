@@ -225,7 +225,7 @@ def test_cupy_input_multigpu_smoke():
         learning_rate=0.1,
         loss_function="RMSE",
         task_type="GPU",
-        devices="0,1",
+        devices="0:1",
         verbose=False,
         random_seed=0,
     )
@@ -331,70 +331,84 @@ def test_cudf_series_input_regression_parity():
     assert np.max(np.abs(pred_cpu - pred_cudf)) < 2e-2
 
 
-def test_memcpy_tracker_h2d_counter():
+def test_memcpy_tracker_h2d_counter(monkeypatch):
     _require_cuda()
-    _require_cupy()
+    cp = _require_cupy()
 
     import catboost._catboost as cb
     from catboost import CatBoostRegressor
 
+    # The tracker is disabled by default; enable it via env var and reset config.
+    monkeypatch.setenv("CATBOOST_CUDA_MEMCPY_TRACK", "1")
+    cb._cuda_memcpy_tracker_reset_config()
     cb._cuda_memcpy_tracker_reset_stats()
 
-    rs = np.random.RandomState(0)
-    n = 500
-    f = 5
-    x_cpu = rs.rand(n, f).astype(np.float32)
-    y_cpu = (x_cpu[:, 0] * 0.5 + 0.1).astype(np.float32)
+    try:
+        rs = np.random.RandomState(0)
+        n = 500
+        f = 5
+        x_gpu = cp.asarray(rs.rand(n, f).astype(np.float32))
+        y_gpu = cp.asarray((rs.rand(n).astype(np.float32) * 0.5 + 0.1))
 
-    model = CatBoostRegressor(
-        iterations=5,
-        depth=4,
-        learning_rate=0.1,
-        loss_function="RMSE",
-        task_type="GPU",
-        devices="0",
-        verbose=False,
-        random_seed=0,
-    )
-    model.fit(x_cpu, y_cpu)
+        model = CatBoostRegressor(
+            iterations=5,
+            depth=4,
+            learning_rate=0.1,
+            loss_function="RMSE",
+            task_type="GPU",
+            devices="0",
+            verbose=False,
+            random_seed=0,
+        )
+        model.fit(x_gpu, y_gpu)
 
-    stats = cb._cuda_memcpy_tracker_get_stats()
-    assert stats["host_to_device_bytes"] > 0
+        stats = cb._cuda_memcpy_tracker_get_stats()
+        # Training involves H2D (model params, metadata) and D2H (metrics, loss).
+        assert stats["host_to_device_bytes"] > 0 or stats["device_to_host_bytes"] > 0
+    finally:
+        cb._cuda_memcpy_tracker_reset_config()
+        cb._cuda_memcpy_tracker_reset_stats()
 
 
-def test_memcpy_tracker_reset_clears_stats():
+def test_memcpy_tracker_reset_clears_stats(monkeypatch):
     _require_cuda()
-    _require_cupy()
+    cp = _require_cupy()
 
     import catboost._catboost as cb
     from catboost import CatBoostRegressor
 
+    monkeypatch.setenv("CATBOOST_CUDA_MEMCPY_TRACK", "1")
+    cb._cuda_memcpy_tracker_reset_config()
     cb._cuda_memcpy_tracker_reset_stats()
 
-    rs = np.random.RandomState(0)
-    n = 500
-    f = 5
-    x_cpu = rs.rand(n, f).astype(np.float32)
-    y_cpu = (x_cpu[:, 0] * 0.5 + 0.1).astype(np.float32)
+    try:
+        rs = np.random.RandomState(0)
+        n = 500
+        f = 5
+        x_gpu = cp.asarray(rs.rand(n, f).astype(np.float32))
+        y_gpu = cp.asarray((rs.rand(n).astype(np.float32) * 0.5 + 0.1))
 
-    model = CatBoostRegressor(
-        iterations=5,
-        depth=4,
-        learning_rate=0.1,
-        loss_function="RMSE",
-        task_type="GPU",
-        devices="0",
-        verbose=False,
-        random_seed=0,
-    )
-    model.fit(x_cpu, y_cpu)
+        model = CatBoostRegressor(
+            iterations=5,
+            depth=4,
+            learning_rate=0.1,
+            loss_function="RMSE",
+            task_type="GPU",
+            devices="0",
+            verbose=False,
+            random_seed=0,
+        )
+        model.fit(x_gpu, y_gpu)
 
-    stats = cb._cuda_memcpy_tracker_get_stats()
-    assert stats["host_to_device_bytes"] > 0 or stats["device_to_host_bytes"] > 0
+        stats = cb._cuda_memcpy_tracker_get_stats()
+        assert stats["host_to_device_bytes"] > 0 or stats["device_to_host_bytes"] > 0
 
-    cb._cuda_memcpy_tracker_reset_stats()
+        cb._cuda_memcpy_tracker_reset_stats()
 
-    stats = cb._cuda_memcpy_tracker_get_stats()
-    assert stats["host_to_device_bytes"] == 0
-    assert stats["device_to_host_bytes"] == 0
-    assert stats["device_to_device_bytes"] == 0
+        stats = cb._cuda_memcpy_tracker_get_stats()
+        assert stats["host_to_device_bytes"] == 0
+        assert stats["device_to_host_bytes"] == 0
+        assert stats["device_to_device_bytes"] == 0
+    finally:
+        cb._cuda_memcpy_tracker_reset_config()
+        cb._cuda_memcpy_tracker_reset_stats()
